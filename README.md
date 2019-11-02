@@ -13,7 +13,7 @@ Since its simple it assume if / is reachable for any host its available
 ```bash
 Usage of simple-lb.exe:
   -backends string
-        Load balanced backends, use commas to separate
+        Load balanced backends, use semicolons to separate
   -port int
         Port to serve (default 3030)
 ```
