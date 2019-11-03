@@ -3,7 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -186,12 +185,9 @@ func handleRequest(serverIndex int, retries int, w http.ResponseWriter, r *http.
 		return
 	}
 
-	copyHeader(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		log.Printf("Backend: %s, Response: %v", u, err.Error())
+	if err := resp.Write(w); err != nil {
+		log.Printf("Error %s\n", err.Error())
 	}
-	_ = resp.Body.Close()
 }
 
 func main() {
