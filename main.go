@@ -15,7 +15,7 @@ import (
 // ServerPool holds information about reachable backends
 type ServerPool struct {
 	servers []*url.URL
-	mux     sync.Mutex
+	mux     sync.RWMutex
 }
 
 // Get a value from ServerPool
@@ -33,6 +33,25 @@ func (s *ServerPool) Add(serverUrl *url.URL) {
 	s.mux.Unlock()
 }
 
+// AddUnique a backend to ServerPool
+func (s *ServerPool) AddUnique(serverUrl *url.URL) {
+	s.mux.Lock()
+	for _, ss := range s.servers {
+		if ss.String() == serverUrl.String() {
+			s.mux.Unlock()
+			return
+		}
+	}
+	s.servers = append(s.servers, serverUrl)
+	s.mux.Unlock()
+}
+
+func (s *ServerPool) GetServers() []*url.URL {
+	s.mux.RLock()
+	defer s.mux.RUnlock()
+	return s.servers
+}
+
 // RemoveIndex from a ServerPool
 func (s *ServerPool) RemoveIndex(i int) {
 	s.mux.Lock()
@@ -43,11 +62,31 @@ func (s *ServerPool) RemoveIndex(i int) {
 	s.mux.Unlock()
 }
 
+func (s *ServerPool) RemoveName(name string) {
+	s.mux.RLock()
+	data := s.servers
+	s.mux.RUnlock()
+	idx := -1
+	for i, v := range data {
+		if v.String() == name {
+			idx = i
+			break
+		}
+	}
+
+	if idx >= 0 {
+		s.mux.Lock()
+		s.servers[idx] = s.servers[len(s.servers)-1]
+		s.servers = s.servers[:len(s.servers)-1]
+		s.mux.Lock()
+	}
+}
+
 // Len of Servers in ServerPool
 func (s *ServerPool) Len() (l int) {
-	s.mux.Lock()
+	s.mux.RLock()
 	l = len(s.servers)
-	s.mux.Unlock()
+	s.mux.RUnlock()
 	return
 }
 
@@ -75,26 +114,27 @@ func getNext() int {
 }
 
 // healthCheck backends
-func healthCheck()  {
+func healthCheck() {
 	heartbeat := time.NewTicker(15 * time.Second)
 	log.Printf("Health Checking Started\n")
 	for {
 		select {
 		case u := <-healthCheckChan:
 			log.Printf("Health Check: %s (down)\n", u.String())
-			unHealthyServers.Add(u)
+			unHealthyServers.AddUnique(u)
 		case <-heartbeat.C:
 			log.Println("Health check routine started")
 			if unHealthyServers.Len() > 0 {
-				var toBeMoved []int
-				for i, value := range unHealthyServers.servers {
+				var toBeMoved []string
+				data := unHealthyServers.GetServers()
+				for _, value := range data {
 					// lets assume if / is reachable the server works, o/w we will have to use something like /status
 					_, err := http.Get(value.String())
 					if err == nil {
 						log.Printf("Health Check: %s (up)\n", value.String())
 						// remove the healthy server from the unhealthy pool and add to healthy pool
-						toBeMoved = append(toBeMoved, i)
-						healthyServers.Add(value)
+						toBeMoved = append(toBeMoved, value.String())
+						healthyServers.AddUnique(value)
 					} else {
 						log.Printf("Health Check: %s (down)\n", value.String())
 					}
@@ -102,7 +142,7 @@ func healthCheck()  {
 
 				// clean the unhealthy pool
 				for _, i := range toBeMoved {
-					unHealthyServers.RemoveIndex(i)
+					unHealthyServers.RemoveName(i)
 				}
 			}
 		}
@@ -112,7 +152,7 @@ func healthCheck()  {
 
 // lb the requests with retries
 func lb(w http.ResponseWriter, r *http.Request) {
-	handleRequest(getNext(),5, w, r)
+	handleRequest(getNext(), 5, w, r)
 }
 
 // copyHeader copies header from a request
@@ -139,9 +179,10 @@ func handleRequest(serverIndex int, retries int, w http.ResponseWriter, r *http.
 	r.URL.Host = u.Host
 	resp, err := http.DefaultTransport.RoundTrip(r)
 	if err != nil {
+		log.Println(err.Error())
 		healthCheckChan <- u
-		healthyServers.RemoveIndex(serverIndex)
-		handleRequest(getNext(), retries - 1, w, r)
+		healthyServers.RemoveName(u.String())
+		handleRequest(getNext(), retries-1, w, r)
 		return
 	}
 
