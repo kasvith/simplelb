@@ -1,199 +1,143 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
+const Attempts = "ATTEMPTS"
+
+type Backend struct {
+	URL          *url.URL
+	Alive        bool
+	ReverseProxy *httputil.ReverseProxy
+}
+
 // ServerPool holds information about reachable backends
 type ServerPool struct {
-	servers []*url.URL
-	mux     sync.RWMutex
+	backends []*Backend
+	mux      sync.RWMutex
+	current  int32
 }
 
-// Get a value from ServerPool
-func (s *ServerPool) Get(i int) (u *url.URL) {
-	s.mux.Lock()
-	u = s.servers[i]
-	s.mux.Unlock()
-	return
-}
-
-// Add a backend to ServerPool
-func (s *ServerPool) Add(serverUrl *url.URL) {
-	s.mux.Lock()
-	s.servers = append(s.servers, serverUrl)
-	s.mux.Unlock()
-}
-
-// AddUnique a backend to ServerPool
-func (s *ServerPool) AddUnique(serverUrl *url.URL) {
-	s.mux.Lock()
-	for _, ss := range s.servers {
-		if ss.String() == serverUrl.String() {
-			s.mux.Unlock()
-			return
-		}
+func (s *ServerPool) NextIndex() int {
+	if len(s.backends) == 0 {
+		return 0
 	}
-	s.servers = append(s.servers, serverUrl)
-	s.mux.Unlock()
+	// atomically increase the counter with bounds
+	atomic.StoreInt32(&s.current, (atomic.LoadInt32(&s.current)+1)%int32(len(s.backends)))
+	return int(atomic.LoadInt32(&s.current))
 }
 
-func (s *ServerPool) GetServers() []*url.URL {
-	s.mux.RLock()
-	defer s.mux.RUnlock()
-	return s.servers
-}
-
-// RemoveIndex from a ServerPool
-func (s *ServerPool) RemoveIndex(i int) {
+func (s *ServerPool) MarkBackendStatus(backendUrl *url.URL, alive bool) {
 	s.mux.Lock()
-	if i >= 0 && i < len(s.servers) {
-		s.servers[i] = s.servers[len(s.servers)-1]
-		s.servers = s.servers[:len(s.servers)-1]
-	}
-	s.mux.Unlock()
-}
-
-func (s *ServerPool) RemoveName(name string) {
-	s.mux.RLock()
-	data := s.servers
-	s.mux.RUnlock()
-	idx := -1
-	for i, v := range data {
-		if v.String() == name {
-			idx = i
+	for i := 0; i < len(s.backends); i++ {
+		if s.backends[i].URL.String() == backendUrl.String() && s.backends[i].Alive != alive {
+			s.backends[i].Alive = alive
 			break
 		}
 	}
-
-	if idx >= 0 {
-		s.mux.Lock()
-		s.servers[idx] = s.servers[len(s.servers)-1]
-		s.servers = s.servers[:len(s.servers)-1]
-		s.mux.Lock()
-	}
+	s.mux.Unlock()
 }
 
-// Len of Servers in ServerPool
-func (s *ServerPool) Len() (l int) {
+func (s *ServerPool) GetNextPeer() *Backend {
 	s.mux.RLock()
-	l = len(s.servers)
+	backends := s.backends
 	s.mux.RUnlock()
-	return
-}
 
-// Counter counts the index
-type Counter struct {
-	value int
-	mux   sync.Mutex
-}
-
-var counter Counter
-var healthyServers ServerPool
-var unHealthyServers ServerPool
-var healthCheckChan = make(chan *url.URL)
-
-// getNext index
-func getNext() int {
-	counter.mux.Lock()
-	if healthyServers.Len() != 0 {
-		counter.value = (counter.value + 1) % healthyServers.Len()
-	} else {
-		counter.value = 0
+	// loop entire backends to find out an alive backend
+	next := s.NextIndex()
+	l := len(backends) + next
+	for i := next; i < l; i++ {
+		idx := i % len(backends)
+		if s.backends[idx].Alive {
+			atomic.StoreInt32(&s.current, int32(idx))
+			return backends[idx]
+		}
 	}
-	counter.mux.Unlock()
-	return counter.value
+	return nil
 }
 
-// healthCheck backends
+func GetAttemptsFromContext(r *http.Request) int {
+	if attempts, ok := r.Context().Value(Attempts).(int); ok {
+		return attempts
+	}
+	return 1
+}
+
+func lb(w http.ResponseWriter, r *http.Request) {
+	attempts := GetAttemptsFromContext(r)
+	if attempts > 5 {
+		log.Printf("%s(%s) Max attempts reached, terminating\n", r.RemoteAddr, r.URL.Path)
+		http.Error(w, "Service not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	peer := serverPool.GetNextPeer()
+	if peer != nil {
+		peer.ReverseProxy.ServeHTTP(w, r)
+		return
+	}
+	http.Error(w, "Service not available", http.StatusServiceUnavailable)
+}
+
+func isAlive(u *url.URL) bool {
+	timeout := 2 * time.Second
+	conn, err := net.DialTimeout("tcp", u.Host, timeout)
+	if err != nil {
+		log.Println("Site unreachable, error: ", err)
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
 func healthCheck() {
-	heartbeat := time.NewTicker(15 * time.Second)
-	log.Printf("Health Checking Started\n")
+	t := time.NewTicker(time.Minute * 2)
 	for {
 		select {
-		case u := <-healthCheckChan:
-			log.Printf("Health Check: %s (down)\n", u.String())
-			unHealthyServers.AddUnique(u)
-		case <-heartbeat.C:
-			log.Println("Health check routine started")
-			if unHealthyServers.Len() > 0 {
-				var toBeMoved []string
-				data := unHealthyServers.GetServers()
-				for _, value := range data {
-					// lets assume if / is reachable the server works, o/w we will have to use something like /status
-					_, err := http.Get(value.String())
-					if err == nil {
-						log.Printf("Health Check: %s (up)\n", value.String())
-						// remove the healthy server from the unhealthy pool and add to healthy pool
-						toBeMoved = append(toBeMoved, value.String())
-						healthyServers.AddUnique(value)
-					} else {
-						log.Printf("Health Check: %s (down)\n", value.String())
-					}
-				}
-
-				// clean the unhealthy pool
-				for _, i := range toBeMoved {
-					unHealthyServers.RemoveName(i)
-				}
-			}
-		}
-
-	}
-}
-
-// lb the requests with retries
-func lb(w http.ResponseWriter, r *http.Request) {
-	handleRequest(getNext(), 5, w, r)
-}
-
-// copyHeader copies header from a request
-func copyHeader(dst, src http.Header) {
-	for k, vv := range src {
-		for _, v := range vv {
-			dst.Add(k, v)
+		case <-t.C:
+			log.Println("Starting health check...")
+			serverPool.HealthCheck()
+			log.Println("Health check completed")
 		}
 	}
 }
 
-// handle a request with retries
-// will return 503 if any server is not reachable
-func handleRequest(serverIndex int, retries int, w http.ResponseWriter, r *http.Request) {
-	if retries < 0 || healthyServers.Len() == 0 {
-		http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
-		return
+func (s *ServerPool) HealthCheck() {
+	s.mux.RLock()
+	backends := s.backends
+	s.mux.RUnlock()
+	for i := 0; i < len(backends); i++ {
+		status := "up"
+		alive := isAlive(backends[i].URL)
+		backends[i].Alive = alive
+		if !alive {
+			status = "down"
+		}
+		log.Printf("%s [%s]\n", backends[i].URL, status)
 	}
-
-	u := healthyServers.Get(serverIndex)
-
-	// hijack the request and change the host to a reachable backend
-	r.URL.Scheme = u.Scheme
-	r.URL.Host = u.Host
-	resp, err := http.DefaultTransport.RoundTrip(r)
-	if err != nil {
-		log.Println(err.Error())
-		healthCheckChan <- u
-		healthyServers.RemoveName(u.String())
-		handleRequest(getNext(), retries-1, w, r)
-		return
-	}
-
-	if err := resp.Write(w); err != nil {
-		log.Printf("Error %s\n", err.Error())
-	}
+	s.mux.Lock()
+	s.backends = backends
+	s.mux.Unlock()
 }
+
+var serverPool ServerPool
 
 func main() {
 	var serverList string
 	var port int
-	flag.StringVar(&serverList, "backends", "", "Load balanced backends, use semicolons to separate")
+	flag.StringVar(&serverList, "backends", "", "Load balanced backends, use commas to separate")
 	flag.IntVar(&port, "port", 3030, "Port to serve")
 	flag.Parse()
 
@@ -202,14 +146,28 @@ func main() {
 	}
 
 	// parse servers
-	tokens := strings.Split(serverList, ";")
+	tokens := strings.Split(serverList, ",")
 	for _, tok := range tokens {
 		serverUrl, err := url.Parse(tok)
 		if err != nil {
 			log.Fatal(err)
 		}
-		// no need to think of race conditions in the initialize state
-		healthyServers.servers = append(healthyServers.servers, serverUrl)
+
+		proxy := httputil.NewSingleHostReverseProxy(serverUrl)
+		proxy.ErrorHandler = func(writer http.ResponseWriter, request *http.Request, e error) {
+			log.Printf("[%s] %s\n", serverUrl.Host, e.Error())
+			serverPool.MarkBackendStatus(serverUrl, false)
+			attempts := GetAttemptsFromContext(request)
+			log.Printf("%s(%s) Attempting retry %d\n", request.RemoteAddr, request.URL.Path, attempts)
+			ctx := context.WithValue(request.Context(), Attempts, attempts+1)
+			lb(writer, request.WithContext(ctx))
+		}
+
+		serverPool.backends = append(serverPool.backends, &Backend{
+			URL:          serverUrl,
+			Alive:        true,
+			ReverseProxy: proxy,
+		})
 		log.Printf("Configured server: %s\n", serverUrl)
 	}
 
@@ -222,7 +180,7 @@ func main() {
 	// start health checking
 	go healthCheck()
 
-	log.Printf("LB started at :%d\n", port)
+	log.Printf("Load Balancer started at :%d\n", port)
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
