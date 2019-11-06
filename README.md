@@ -11,7 +11,7 @@ Since its simple it assume if / is reachable for any host its available
 
 # How to use
 ```bash
-Usage of .\simplelb.exe:
+Usage:
   -backends string
         Load balanced backends, use commas to separate
   -port int
