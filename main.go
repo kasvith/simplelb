@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -18,11 +17,14 @@ import (
 
 type key int
 
-const Attempts key = iota
+const (
+	Attempts key = iota
+	Retry
+)
 
 type Backend struct {
 	URL          *url.URL
-	Alive        bool
+	Alive        uint32
 	ReverseProxy *httputil.ReverseProxy
 }
 
@@ -33,45 +35,61 @@ type ServerPool struct {
 	current  uint64
 }
 
+// AddBackend to the server pool
+func (s *ServerPool) AddBackend(backend *Backend) {
+	s.backends = append(s.backends, backend)
+}
+
+// NextIndex atomically increase the counter and return an index
 func (s *ServerPool) NextIndex() int {
-	if len(s.backends) == 0 {
-		return 0
-	}
-	// atomically increase the counter with bounds
 	return int(atomic.AddUint64(&s.current, uint64(1)) % uint64(len(s.backends)))
 }
 
-func (s *ServerPool) MarkBackendStatus(backendUrl *url.URL, alive bool) {
-	s.mux.Lock()
+func (s *ServerPool) StoreIndex(i uint64) {
+	atomic.StoreUint64(&s.current, i)
+}
+
+// MarkBackendStatus changes a status of a backend
+func (s *ServerPool) MarkBackendStatus(backendUrl *url.URL, alive uint32) {
 	for i := 0; i < len(s.backends); i++ {
-		if s.backends[i].URL.String() == backendUrl.String() && s.backends[i].Alive != alive {
-			s.backends[i].Alive = alive
+		if s.backends[i].URL.String() == backendUrl.String() && atomic.LoadUint32(&s.backends[i].Alive) != alive {
+			atomic.StoreUint32(&s.backends[i].Alive, alive)
 			break
 		}
 	}
-	s.mux.Unlock()
 }
 
+// GetNextPeer returns next active peer to take a connection
 func (s *ServerPool) GetNextPeer() *Backend {
-	s.mux.RLock()
-	backends := s.backends
-	s.mux.RUnlock()
-
 	// loop entire backends to find out an alive backend
 	next := s.NextIndex()
-	l := len(backends) + next
+	l := len(s.backends) + next
 	for i := next; i < l; i++ {
-		idx := i % len(backends)
-		if s.backends[idx].Alive {
+		idx := i % len(s.backends)
+		if atomic.LoadUint32(&s.backends[idx].Alive) == 1 {
 			if i != next {
-				atomic.StoreUint64(&s.current, uint64(idx))
+				serverPool.StoreIndex(uint64(idx))
 			}
-			return backends[idx]
+			return s.backends[idx]
 		}
 	}
 	return nil
 }
 
+// HealthCheck pings the backends and update the status
+func (s *ServerPool) HealthCheck() {
+	for i := 0; i < len(s.backends); i++ {
+		status := "up"
+		alive := isAlive(s.backends[i].URL)
+		atomic.StoreUint32(&s.backends[i].Alive, alive)
+		if alive == 0 {
+			status = "down"
+		}
+		log.Printf("%s [%s]\n", s.backends[i].URL, status)
+	}
+}
+
+// GetAttemptsFromContext returns the attempts for request
 func GetAttemptsFromContext(r *http.Request) int {
 	if attempts, ok := r.Context().Value(Attempts).(int); ok {
 		return attempts
@@ -79,6 +97,15 @@ func GetAttemptsFromContext(r *http.Request) int {
 	return 1
 }
 
+// GetAttemptsFromContext returns the attempts for request
+func GetRetryFromContext(r *http.Request) int {
+	if retry, ok := r.Context().Value(Retry).(int); ok {
+		return retry
+	}
+	return 0
+}
+
+// lb load balances the incoming request
 func lb(w http.ResponseWriter, r *http.Request) {
 	attempts := GetAttemptsFromContext(r)
 	if attempts > 5 {
@@ -95,19 +122,21 @@ func lb(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "Service not available", http.StatusServiceUnavailable)
 }
 
-func isAlive(u *url.URL) bool {
+// isAlive checks whether a backend is alive by establishing a TCP connection
+func isAlive(u *url.URL) uint32 {
 	timeout := 2 * time.Second
 	conn, err := net.DialTimeout("tcp", u.Host, timeout)
 	if err != nil {
 		log.Println("Site unreachable, error: ", err)
-		return false
+		return 0
 	}
 	_ = conn.Close()
-	return true
+	return 1
 }
 
+// healthCheck runs a routine for check status of the backends every 2 mins
 func healthCheck() {
-	t := time.NewTicker(time.Minute * 2)
+	t := time.NewTicker(time.Second * 20)
 	for {
 		select {
 		case <-t.C:
@@ -116,24 +145,6 @@ func healthCheck() {
 			log.Println("Health check completed")
 		}
 	}
-}
-
-func (s *ServerPool) HealthCheck() {
-	s.mux.RLock()
-	backends := s.backends
-	s.mux.RUnlock()
-	for i := 0; i < len(backends); i++ {
-		status := "up"
-		alive := isAlive(backends[i].URL)
-		backends[i].Alive = alive
-		if !alive {
-			status = "down"
-		}
-		log.Printf("%s [%s]\n", backends[i].URL, status)
-	}
-	s.mux.Lock()
-	s.backends = backends
-	s.mux.Unlock()
 }
 
 var serverPool ServerPool
@@ -160,22 +171,30 @@ func main() {
 		proxy := httputil.NewSingleHostReverseProxy(serverUrl)
 		proxy.ErrorHandler = func(writer http.ResponseWriter, request *http.Request, e error) {
 			log.Printf("[%s] %s\n", serverUrl.Host, e.Error())
-			serverPool.MarkBackendStatus(serverUrl, false)
+			retries := GetRetryFromContext(request)
+			if retries < 3 {
+				select {
+				case <-time.After(10 * time.Millisecond):
+					ctx := context.WithValue(request.Context(), Retry, retries+1)
+					proxy.ServeHTTP(writer, request.WithContext(ctx))
+				}
+				return
+			}
+
+			serverPool.MarkBackendStatus(serverUrl, 0)
 			attempts := GetAttemptsFromContext(request)
 			log.Printf("%s(%s) Attempting retry %d\n", request.RemoteAddr, request.URL.Path, attempts)
 			ctx := context.WithValue(request.Context(), Attempts, attempts+1)
 			lb(writer, request.WithContext(ctx))
 		}
 
-		serverPool.backends = append(serverPool.backends, &Backend{
+		serverPool.AddBackend(&Backend{
 			URL:          serverUrl,
-			Alive:        true,
+			Alive:        1,
 			ReverseProxy: proxy,
 		})
 		log.Printf("Configured server: %s\n", serverUrl)
 	}
-
-	serverPool.current = uint64(math.MaxUint64)
 
 	// start http server
 	server := http.Server{
