@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -15,7 +16,9 @@ import (
 	"time"
 )
 
-const Attempts = "ATTEMPTS"
+type key int
+
+const Attempts key = iota
 
 type Backend struct {
 	URL          *url.URL
@@ -27,7 +30,7 @@ type Backend struct {
 type ServerPool struct {
 	backends []*Backend
 	mux      sync.RWMutex
-	current  int32
+	current  uint64
 }
 
 func (s *ServerPool) NextIndex() int {
@@ -35,8 +38,7 @@ func (s *ServerPool) NextIndex() int {
 		return 0
 	}
 	// atomically increase the counter with bounds
-	atomic.StoreInt32(&s.current, (atomic.LoadInt32(&s.current)+1)%int32(len(s.backends)))
-	return int(atomic.LoadInt32(&s.current))
+	return int(atomic.AddUint64(&s.current, uint64(1)) % uint64(len(s.backends)))
 }
 
 func (s *ServerPool) MarkBackendStatus(backendUrl *url.URL, alive bool) {
@@ -61,7 +63,9 @@ func (s *ServerPool) GetNextPeer() *Backend {
 	for i := next; i < l; i++ {
 		idx := i % len(backends)
 		if s.backends[idx].Alive {
-			atomic.StoreInt32(&s.current, int32(idx))
+			if i != next {
+				atomic.StoreUint64(&s.current, uint64(idx))
+			}
 			return backends[idx]
 		}
 	}
@@ -170,6 +174,8 @@ func main() {
 		})
 		log.Printf("Configured server: %s\n", serverUrl)
 	}
+
+	serverPool.current = uint64(math.MaxUint64)
 
 	// start http server
 	server := http.Server{
