@@ -7,4 +7,4 @@ FROM alpine:latest
 RUN apk --no-cache add ca-certificates
 WORKDIR /root/
 COPY --from=builder /app/lb .
-ENTRYPOINT [ "/root/lb" ]
+ENTRYPOINT [ "./lb" ]

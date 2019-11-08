@@ -1,7 +1,7 @@
 version: "2"
 services:
   front:
-    build: .
+    image: kasvith/simplelb:mux
     container_name: load-balancer
     ports:
       - "3030:3030"
