@@ -24,14 +24,29 @@ const (
 
 type Backend struct {
 	URL          *url.URL
-	Alive        uint32
+	Alive        bool
+	mux          sync.RWMutex
 	ReverseProxy *httputil.ReverseProxy
+}
+
+func (b *Backend) SetAlive(alive bool) {
+	b.mux.Lock()
+	if b.Alive != alive {
+		b.Alive = alive
+	}
+	b.mux.Unlock()
+}
+
+func (b *Backend) IsAlive() (alive bool) {
+	b.mux.RLock()
+	alive = b.Alive
+	b.mux.RUnlock()
+	return
 }
 
 // ServerPool holds information about reachable backends
 type ServerPool struct {
 	backends []*Backend
-	mux      sync.RWMutex
 	current  uint64
 }
 
@@ -45,15 +60,11 @@ func (s *ServerPool) NextIndex() int {
 	return int(atomic.AddUint64(&s.current, uint64(1)) % uint64(len(s.backends)))
 }
 
-func (s *ServerPool) StoreIndex(i uint64) {
-	atomic.StoreUint64(&s.current, i)
-}
-
 // MarkBackendStatus changes a status of a backend
-func (s *ServerPool) MarkBackendStatus(backendUrl *url.URL, alive uint32) {
-	for i := 0; i < len(s.backends); i++ {
-		if s.backends[i].URL.String() == backendUrl.String() && atomic.LoadUint32(&s.backends[i].Alive) != alive {
-			atomic.StoreUint32(&s.backends[i].Alive, alive)
+func (s *ServerPool) MarkBackendStatus(backendUrl *url.URL, alive bool) {
+	for _, b := range s.backends {
+		if b.URL.String() == backendUrl.String() {
+			b.SetAlive(alive)
 			break
 		}
 	}
@@ -61,14 +72,14 @@ func (s *ServerPool) MarkBackendStatus(backendUrl *url.URL, alive uint32) {
 
 // GetNextPeer returns next active peer to take a connection
 func (s *ServerPool) GetNextPeer() *Backend {
-	// loop entire backends to find out an alive backend
+	// loop entire backends to find out an Alive backend
 	next := s.NextIndex()
 	l := len(s.backends) + next
 	for i := next; i < l; i++ {
 		idx := i % len(s.backends)
-		if atomic.LoadUint32(&s.backends[idx].Alive) == 1 {
+		if s.backends[idx].IsAlive() {
 			if i != next {
-				serverPool.StoreIndex(uint64(idx))
+				atomic.StoreUint64(&s.current, uint64(idx))
 			}
 			return s.backends[idx]
 		}
@@ -78,14 +89,14 @@ func (s *ServerPool) GetNextPeer() *Backend {
 
 // HealthCheck pings the backends and update the status
 func (s *ServerPool) HealthCheck() {
-	for i := 0; i < len(s.backends); i++ {
+	for _, b := range s.backends {
 		status := "up"
-		alive := isAlive(s.backends[i].URL)
-		atomic.StoreUint32(&s.backends[i].Alive, alive)
-		if alive == 0 {
+		alive := isBackendAlive(b.URL)
+		b.SetAlive(alive)
+		if !alive {
 			status = "down"
 		}
-		log.Printf("%s [%s]\n", s.backends[i].URL, status)
+		log.Printf("%s [%s]\n", b.URL, status)
 	}
 }
 
@@ -122,16 +133,16 @@ func lb(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "Service not available", http.StatusServiceUnavailable)
 }
 
-// isAlive checks whether a backend is alive by establishing a TCP connection
-func isAlive(u *url.URL) uint32 {
+// isAlive checks whether a backend is Alive by establishing a TCP connection
+func isBackendAlive(u *url.URL) bool {
 	timeout := 2 * time.Second
 	conn, err := net.DialTimeout("tcp", u.Host, timeout)
 	if err != nil {
 		log.Println("Site unreachable, error: ", err)
-		return 0
+		return false
 	}
 	_ = conn.Close()
-	return 1
+	return true
 }
 
 // healthCheck runs a routine for check status of the backends every 2 mins
@@ -181,7 +192,7 @@ func main() {
 				return
 			}
 
-			serverPool.MarkBackendStatus(serverUrl, 0)
+			serverPool.MarkBackendStatus(serverUrl, false)
 			attempts := GetAttemptsFromContext(request)
 			log.Printf("%s(%s) Attempting retry %d\n", request.RemoteAddr, request.URL.Path, attempts)
 			ctx := context.WithValue(request.Context(), Attempts, attempts+1)
@@ -190,7 +201,7 @@ func main() {
 
 		serverPool.AddBackend(&Backend{
 			URL:          serverUrl,
-			Alive:        1,
+			Alive:        true,
 			ReverseProxy: proxy,
 		})
 		log.Printf("Configured server: %s\n", serverUrl)
