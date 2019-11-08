@@ -1,0 +1,14 @@
+version: "2"
+services:
+  front:
+    image: kasvith/simplelb:mux
+    container_name: load-balancer
+    ports:
+      - "3030:3030"
+    command: ./lb --backends "http://web1:80,http://web2:80,http://web3:80"
+  web1:
+    image: strm/helloworld-http
+  web2:
+    image: strm/helloworld-http
+  web3:
+    image: strm/helloworld-http
