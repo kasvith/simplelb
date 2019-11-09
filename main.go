@@ -15,13 +15,12 @@ import (
 	"time"
 )
 
-type key int
-
 const (
-	Attempts key = iota
+	Attempts int = iota
 	Retry
 )
 
+// Backend holds the data about a server
 type Backend struct {
 	URL          *url.URL
 	Alive        bool
@@ -29,14 +28,14 @@ type Backend struct {
 	ReverseProxy *httputil.ReverseProxy
 }
 
+// SetAlive for this backend
 func (b *Backend) SetAlive(alive bool) {
 	b.mux.Lock()
-	if b.Alive != alive {
-		b.Alive = alive
-	}
+	b.Alive = alive
 	b.mux.Unlock()
 }
 
+// IsAlive returns true when backend is alive
 func (b *Backend) IsAlive() (alive bool) {
 	b.mux.RLock()
 	alive = b.Alive
@@ -74,10 +73,10 @@ func (s *ServerPool) MarkBackendStatus(backendUrl *url.URL, alive bool) {
 func (s *ServerPool) GetNextPeer() *Backend {
 	// loop entire backends to find out an Alive backend
 	next := s.NextIndex()
-	l := len(s.backends) + next
+	l := len(s.backends) + next // start from next and move a full cycle
 	for i := next; i < l; i++ {
-		idx := i % len(s.backends)
-		if s.backends[idx].IsAlive() {
+		idx := i % len(s.backends) // take an index by modding
+		if s.backends[idx].IsAlive() { // if we have an alive backend, use it and store if its not the original one
 			if i != next {
 				atomic.StoreUint64(&s.current, uint64(idx))
 			}
@@ -119,7 +118,7 @@ func GetRetryFromContext(r *http.Request) int {
 // lb load balances the incoming request
 func lb(w http.ResponseWriter, r *http.Request) {
 	attempts := GetAttemptsFromContext(r)
-	if attempts > 5 {
+	if attempts > 3 {
 		log.Printf("%s(%s) Max attempts reached, terminating\n", r.RemoteAddr, r.URL.Path)
 		http.Error(w, "Service not available", http.StatusServiceUnavailable)
 		return
@@ -192,7 +191,10 @@ func main() {
 				return
 			}
 
+			// after 3 retries, mark this backend as down
 			serverPool.MarkBackendStatus(serverUrl, false)
+
+			// if the same request routing for few attempts with different backends, increase the count
 			attempts := GetAttemptsFromContext(request)
 			log.Printf("%s(%s) Attempting retry %d\n", request.RemoteAddr, request.URL.Path, attempts)
 			ctx := context.WithValue(request.Context(), Attempts, attempts+1)
@@ -207,7 +209,7 @@ func main() {
 		log.Printf("Configured server: %s\n", serverUrl)
 	}
 
-	// start http server
+	// create http server
 	server := http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
 		Handler: http.HandlerFunc(lb),
