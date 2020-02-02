@@ -146,7 +146,7 @@ func isBackendAlive(u *url.URL) bool {
 
 // healthCheck runs a routine for check status of the backends every 2 mins
 func healthCheck() {
-	t := time.NewTicker(time.Second * 20)
+	t := time.NewTicker(time.Minute * 2)
 	for {
 		select {
 		case <-t.C:
