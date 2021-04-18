@@ -15,8 +15,10 @@ import (
 	"time"
 )
 
+type requestType int
+
 const (
-	Attempts int = iota
+	Attempts requestType = iota
 	Retry
 )
 
@@ -75,7 +77,7 @@ func (s *ServerPool) GetNextPeer() *Backend {
 	next := s.NextIndex()
 	l := len(s.backends) + next // start from next and move a full cycle
 	for i := next; i < l; i++ {
-		idx := i % len(s.backends) // take an index by modding
+		idx := i % len(s.backends)     // take an index by modding
 		if s.backends[idx].IsAlive() { // if we have an alive backend, use it and store if its not the original one
 			if i != next {
 				atomic.StoreUint64(&s.current, uint64(idx))
@@ -147,13 +149,10 @@ func isBackendAlive(u *url.URL) bool {
 // healthCheck runs a routine for check status of the backends every 2 mins
 func healthCheck() {
 	t := time.NewTicker(time.Minute * 2)
-	for {
-		select {
-		case <-t.C:
-			log.Println("Starting health check...")
-			serverPool.HealthCheck()
-			log.Println("Health check completed")
-		}
+	for range t.C {
+		log.Println("Starting health check...")
+		serverPool.HealthCheck()
+		log.Println("Health check completed")
 	}
 }
 
@@ -169,9 +168,25 @@ func main() {
 	if len(serverList) == 0 {
 		log.Fatal("Please provide one or more backends to load balance")
 	}
-
 	// parse servers
-	tokens := strings.Split(serverList, ",")
+	list := strings.Split(serverList, ",")
+	tokens := []string{}
+	set := map[string]bool{}
+	for _, curr := range list {
+		curr := strings.TrimSpace(curr)
+		if len(curr) == 0 {
+			continue
+		}
+		tokens = append(tokens, curr)
+		if set[curr] {
+			log.Fatalf("Backend %s is already presented \n", curr)
+		}
+		set[curr] = true
+	}
+	if len(tokens) == 0 {
+		log.Fatal("Provide one or more backends to load balance")
+	}
+
 	for _, tok := range tokens {
 		serverUrl, err := url.Parse(tok)
 		if err != nil {
@@ -183,11 +198,9 @@ func main() {
 			log.Printf("[%s] %s\n", serverUrl.Host, e.Error())
 			retries := GetRetryFromContext(request)
 			if retries < 3 {
-				select {
-				case <-time.After(10 * time.Millisecond):
-					ctx := context.WithValue(request.Context(), Retry, retries+1)
-					proxy.ServeHTTP(writer, request.WithContext(ctx))
-				}
+				time.Sleep(10 * time.Millisecond)
+				ctx := context.WithValue(request.Context(), Retry, retries+1)
+				proxy.ServeHTTP(writer, request.WithContext(ctx))
 				return
 			}
 
