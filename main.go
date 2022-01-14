@@ -140,7 +140,7 @@ func isBackendAlive(u *url.URL) bool {
 		log.Println("Site unreachable, error: ", err)
 		return false
 	}
-	_ = conn.Close()
+	defer conn.Close()
 	return true
 }
 
