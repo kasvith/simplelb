@@ -15,9 +15,17 @@ import (
 	"time"
 )
 
+type RequestDetails struct {
+	m map[int]int
+}
+
+func (rd RequestDetails) Get(key int) int {
+	return rd.m[key]
+}
+
 const (
 	Attempts int = iota
-	Retry
+	Retries
 )
 
 // Backend holds the data about a server
@@ -101,16 +109,16 @@ func (s *ServerPool) HealthCheck() {
 
 // GetAttemptsFromContext returns the attempts for request
 func GetAttemptsFromContext(r *http.Request) int {
-	if attempts, ok := r.Context().Value(Attempts).(int); ok {
+	if attempts, ok := r.Context().Value("RequestDetails").(map[int]int)[Attempts]; ok {
 		return attempts
 	}
 	return 1
 }
 
-// GetAttemptsFromContext returns the attempts for request
-func GetRetryFromContext(r *http.Request) int {
-	if retry, ok := r.Context().Value(Retry).(int); ok {
-		return retry
+// GetRetriesFromContext returns the retries for request
+func GetRetriesFromContext(r *http.Request) int {
+	if retries, ok := r.Context().Value("RequestDetails").(map[int]int)[Retries]; ok {
+		return retries
 	}
 	return 0
 }
@@ -181,11 +189,15 @@ func main() {
 		proxy := httputil.NewSingleHostReverseProxy(serverUrl)
 		proxy.ErrorHandler = func(writer http.ResponseWriter, request *http.Request, e error) {
 			log.Printf("[%s] %s\n", serverUrl.Host, e.Error())
-			retries := GetRetryFromContext(request)
+			retries := GetRetriesFromContext(request)
 			if retries < 3 {
 				select {
 				case <-time.After(10 * time.Millisecond):
-					ctx := context.WithValue(request.Context(), Retry, retries+1)
+					rd := &RequestDetails{m: map[int]int{
+						Retries: retries + 1,
+					},
+					}
+					ctx := context.WithValue(request.Context(), "RequestDetails", rd)
 					proxy.ServeHTTP(writer, request.WithContext(ctx))
 				}
 				return
@@ -197,7 +209,12 @@ func main() {
 			// if the same request routing for few attempts with different backends, increase the count
 			attempts := GetAttemptsFromContext(request)
 			log.Printf("%s(%s) Attempting retry %d\n", request.RemoteAddr, request.URL.Path, attempts)
-			ctx := context.WithValue(request.Context(), Attempts, attempts+1)
+			rd := &RequestDetails{m: map[int]int{
+				Attempts: attempts + 1,
+				Retries:  0,
+			},
+			}
+			ctx := context.WithValue(request.Context(), "RequestDetails", rd)
 			lb(writer, request.WithContext(ctx))
 		}
 
