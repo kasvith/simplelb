@@ -107,7 +107,7 @@ func GetAttemptsFromContext(r *http.Request) int {
 	return 1
 }
 
-// GetAttemptsFromContext returns the attempts for request
+// GetRetryFromContext returns the retries for request
 func GetRetryFromContext(r *http.Request) int {
 	if retry, ok := r.Context().Value(Retry).(int); ok {
 		return retry
