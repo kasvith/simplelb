@@ -56,7 +56,14 @@ func (s *ServerPool) AddBackend(backend *Backend) {
 
 // NextIndex atomically increase the counter and return an index
 func (s *ServerPool) NextIndex() int {
-	return int(atomic.AddUint64(&s.current, uint64(1)) % uint64(len(s.backends)))
+	for {
+		current := atomic.LoadUint64(&s.current)
+		// increase the counter in a circular fashion
+		next := (current + 1) % uint64(len(s.backends))
+		if atomic.CompareAndSwapUint64(&s.current, current, next) {
+			return int(next)
+		}
+	}
 }
 
 // MarkBackendStatus changes a status of a backend
@@ -75,7 +82,7 @@ func (s *ServerPool) GetNextPeer() *Backend {
 	next := s.NextIndex()
 	l := len(s.backends) + next // start from next and move a full cycle
 	for i := next; i < l; i++ {
-		idx := i % len(s.backends) // take an index by modding
+		idx := i % len(s.backends)     // take an index by modding
 		if s.backends[idx].IsAlive() { // if we have an alive backend, use it and store if its not the original one
 			if i != next {
 				atomic.StoreUint64(&s.current, uint64(idx))
